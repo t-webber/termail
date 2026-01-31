@@ -1,6 +1,7 @@
 use std::env;
 use std::net::TcpStream;
 
+use imap::types::Flag;
 use native_tls::{TlsConnector, TlsStream};
 use utf7_imap::decode_utf7_imap;
 
@@ -23,12 +24,15 @@ impl Email {
         Self(session)
     }
 
-    fn first_inbox_message(&mut self) -> String {
+    fn first_inbox_message(&mut self) -> (bool, String) {
         self.0.select("INBOX").unwrap();
 
-        let messages = self.0.fetch("1", BODY).unwrap();
+        let messages = self.0.fetch("1", "(FLAGS BODY.PEEK[])").unwrap();
         let message = messages.iter().next().unwrap();
-        str::from_utf8(message.body().unwrap()).unwrap().to_owned()
+
+        let seen = message.flags().contains(&Flag::Seen);
+        let body = str::from_utf8(message.body().unwrap()).unwrap().to_owned();
+        (seen, body)
     }
 
     fn list_boxes(&mut self) -> Vec<String> {

@@ -3,13 +3,15 @@ use chrono::FixedOffset;
 use core::iter;
 use encoded_words::decode;
 use imap::types::Flag;
-use mailparse::MailHeaderMap as _;
+use mailparse::MailHeaderMap;
 use mailparse::ParsedMail;
 use mailparse::parse_mail;
 use native_tls::{TlsConnector, TlsStream};
+use std::collections::HashMap;
 use std::env;
 use std::net::TcpStream;
 use utf7_imap::decode_utf7_imap;
+use utf7_imap::encode_utf7_imap;
 
 fn split_and_parse_header(email: &ParsedMail, name: &str) -> Vec<String> {
     email
@@ -19,11 +21,15 @@ fn split_and_parse_header(email: &ParsedMail, name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-struct Email(imap::Session<TlsStream<TcpStream>>);
+type Session = imap::Session<TlsStream<TcpStream>>;
+
+type Map = HashMap<String, (String, u32)>;
+
+struct Email(Session, Map);
 
 impl Email {
-    fn parse_email(&mut self, uid: u32) -> EmailData {
-        let messages = self.0.fetch(uid.to_string(), "RFC822").unwrap();
+    fn parse_email(session: &mut Session, map: &Map, uid: u32) -> EmailData {
+        let messages = session.uid_fetch(uid.to_string(), "RFC822").unwrap();
         let message = messages.iter().next().unwrap();
         let raw = message.body().unwrap();
         let parsed = parse_mail(raw).unwrap();
@@ -34,6 +40,10 @@ impl Email {
         let bcc = split_and_parse_header(&parsed, "Bcc");
         let subject =
             parsed.headers.get_first_value("Subject").unwrap_or_default();
+        let parent = parsed
+            .headers
+            .get_first_value("In-Reply-To")
+            .map(|parent_mid| map.get(&parent_mid).unwrap().to_owned());
 
         let datetime = DateTime::parse_from_rfc2822(
             &parsed.headers.get_first_value("Date").unwrap(),
@@ -51,7 +61,18 @@ impl Email {
             }
         }
 
-        EmailData { txt, html, from, to, subject, cc, bcc, datetime }
+        EmailData {
+            txt,
+            html,
+            from,
+            to,
+            subject,
+            cc,
+            bcc,
+            datetime,
+            attachements: vec![],
+            parent,
+        }
     }
 
     fn new() -> Self {
@@ -65,7 +86,33 @@ impl Email {
             imap::connect(addr, domain.as_str(), &ssl_connector).unwrap();
 
         let session = client.login(username, password).unwrap();
-        Self(session)
+
+        Self(session, HashMap::new())
+    }
+
+    fn populate_mids(&mut self) {
+        let boxes = self.list_boxes();
+
+        for b in boxes {
+            println!("Populating mids for box: {b}");
+            if let Err(e) = self.0.select(encode_utf7_imap(b.clone())) {
+                eprintln!("Failed to select box {b}: {e}");
+                continue;
+            }
+            let fetches = self.0.uid_fetch("1:*", "(UID ENVELOPE)").unwrap();
+
+            for msg in fetches.iter() {
+                let uid = msg.uid.unwrap();
+                let mid = msg.envelope().unwrap().message_id.unwrap();
+
+                self.1.insert(
+                    String::from_utf8(mid.to_vec()).unwrap(),
+                    (b.clone(), uid),
+                );
+            }
+        }
+
+        self.0.close().unwrap();
     }
 
     fn first_inbox_message(&mut self) -> (bool, String) {
@@ -111,23 +158,19 @@ impl Email {
             .collect()
     }
 
-    fn find_with_subject(&mut self, subject: &str) -> Option<u32> {
-        let uids = self.0.search("ALL").unwrap();
-
-        for uid in uids {
-            let msgs = self.0.fetch(uid.to_string(), "RFC822").unwrap();
-            let msg = msgs.iter().next().unwrap();
-            let raw = msg.body().unwrap();
-
-            let parsed = mailparse::parse_mail(raw).unwrap();
-            if let Some(subj) = parsed.headers.get_first_value("Subject") {
-                let decoded = decode(&subj).map(|s| s.decoded).unwrap_or(subj);
-                if decoded == subject {
-                    return Some(uid);
-                }
+    fn find_with_subject(
+        &mut self,
+        subject: &str,
+    ) -> Option<(String, u32, EmailData)> {
+        println!("Searching for {subject}");
+        for (_mid, (folder, uid)) in &self.1 {
+            self.0.select(folder).unwrap();
+            let data = Self::parse_email(&mut self.0, &self.1, *uid);
+            if data.subject == subject {
+                return Some((folder.to_owned(), *uid, data));
             }
         }
-
+        self.0.close().unwrap();
         None
     }
 }
@@ -148,14 +191,30 @@ struct EmailData {
     cc: Vec<String>,
     bcc: Vec<String>,
     datetime: DateTime<FixedOffset>,
+    parent: Option<(String, u32)>,
+    attachements: Vec<Attachment>,
+}
+
+#[derive(Debug, Default)]
+struct Attachment {
+    filename: String,
+    mime: String,
+    data: Vec<u8>,
 }
 
 fn main() {
     let mut app = Email::new();
+    app.populate_mids();
 
-    app.0.select("Sent").unwrap();
-    let uid = app.find_with_subject("Example subject").unwrap();
-    dbg!(app.parse_email(uid));
+    let (_, puid, parent) = app.find_with_subject("Example subject").unwrap();
+    dbg!(puid);
+    dbg!(parent.parent);
+
+    let (_, uid, reply) =
+        app.find_with_subject("Reply to Example subject").unwrap();
+    dbg!(uid);
+    dbg!(reply.parent);
+
     app.0.select("INBOX").unwrap();
     dbg!(app.first_inbox_message());
     dbg!(app.list_boxes());

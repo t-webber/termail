@@ -3,13 +3,18 @@ use chrono::FixedOffset;
 use core::iter;
 use encoded_words::decode;
 use imap::types::Flag;
+use mailparse::DispositionType;
 use mailparse::MailHeaderMap;
 use mailparse::ParsedMail;
 use mailparse::parse_mail;
 use native_tls::{TlsConnector, TlsStream};
 use std::collections::HashMap;
 use std::env;
+use std::fs;
+use std::fs::File;
 use std::net::TcpStream;
+use std::path::Path;
+use std::path::PathBuf;
 use utf7_imap::decode_utf7_imap;
 use utf7_imap::encode_utf7_imap;
 
@@ -52,12 +57,22 @@ impl Email {
 
         let mut txt = String::new();
         let mut html = String::new();
+        let mut attachments = Vec::new();
 
         for part in parsed.subparts.iter().chain(iter::once(&parsed)) {
             match part.ctype.mimetype.as_str() {
-                "text/plain" => txt = part.get_body().unwrap_or_default(),
-                "text/html" => html = part.get_body().unwrap_or_default(),
-                _ => {}
+                "text/plain" => txt = part.get_body().unwrap(),
+                "text/html" => html = part.get_body().unwrap(),
+                _ => {
+                    let mut cd = part.get_content_disposition();
+                    if cd.disposition == DispositionType::Attachment {
+                        let attachment = Attachment {
+                            filename: cd.params.remove("filename").unwrap(),
+                            data: part.get_body_raw().unwrap(),
+                        };
+                        attachments.push(attachment);
+                    }
+                }
             }
         }
 
@@ -70,7 +85,7 @@ impl Email {
             cc,
             bcc,
             datetime,
-            attachements: vec![],
+            attachments,
             parent,
         }
     }
@@ -90,8 +105,8 @@ impl Email {
         Self(session, HashMap::new())
     }
 
-    fn populate_mids(&mut self) {
-        let boxes = self.list_boxes();
+    fn populate_mids(&mut self, box_list: Option<Vec<String>>) {
+        let boxes = box_list.unwrap_or_else(|| self.list_boxes());
 
         for b in boxes {
             println!("Populating mids for box: {b}");
@@ -192,31 +207,29 @@ struct EmailData {
     bcc: Vec<String>,
     datetime: DateTime<FixedOffset>,
     parent: Option<(String, u32)>,
-    attachements: Vec<Attachment>,
+    attachments: Vec<Attachment>,
+}
+
+impl EmailData {
+    fn save_attachments(&self, folder: &Path) {
+        for attachment in &self.attachments {
+            let file_path = folder.join(&attachment.filename);
+            fs::write(file_path, &attachment.data).unwrap();
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct Attachment {
     filename: String,
-    mime: String,
     data: Vec<u8>,
 }
 
 fn main() {
     let mut app = Email::new();
-    app.populate_mids();
-
-    let (_, puid, parent) = app.find_with_subject("Example subject").unwrap();
-    dbg!(puid);
-    dbg!(parent.parent);
-
-    let (_, uid, reply) =
-        app.find_with_subject("Reply to Example subject").unwrap();
-    dbg!(uid);
-    dbg!(reply.parent);
-
+    app.populate_mids(Some(vec!["INBOX".to_owned()]));
     app.0.select("INBOX").unwrap();
-    dbg!(app.first_inbox_message());
-    dbg!(app.list_boxes());
-    dbg!(app.most_recent());
+    let email = Email::parse_email(&mut app.0, &app.1, 2625);
+    dbg!(&email.subject);
+    email.save_attachments(&PathBuf::from(".data"));
 }
